@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""
+APM466 Assignment Analysis
+
+Uses scraped_data/bonds_final_price_matrix.csv to:
+  - compute YTM per bond per day
+  - construct daily yield/spot/forward curves for 1-5 years
+  - compute covariance matrices of log-returns (yields, forwards)
+  - compute eigenvalues/eigenvectors (PCA)
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import re
+from pathlib import Path
+from typing import Iterable, Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+FACE_VALUE = 100.0
+COUPON_FREQ = 2  # semi-annual
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="APM466 yield/spot/forward analysis.")
+    parser.add_argument(
+        "--data",
+        default="scraped_data/bonds_final_price_matrix.csv",
+        help="Path to bonds_final_price_matrix.csv",
+    )
+    parser.add_argument("--outdir", default="analysis_outputs", help="Output directory.")
+    parser.add_argument("--select-count", type=int, default=10, help="Number of bonds to select.")
+    parser.add_argument("--max-years", type=float, default=5.0, help="Max maturity (years) for selection.")
+    parser.add_argument(
+        "--no-interp",
+        action="store_true",
+        help="Disable interpolation of yields/spot rates to target maturities.",
+    )
+    parser.add_argument(
+        "--year-hint",
+        type=int,
+        default=2026,
+        help="Year for Jan05-style columns (bonds_clean_matrix format).",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Disable plot generation.",
+    )
+    return parser.parse_args()
+
+
+def date_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(c))]
+
+
+def monthday_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if re.fullmatch(r"[A-Za-z]{3}\d{2}", str(c))]
+
+
+def normalize_monthday_columns(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    month_map = {
+        "Jan": 1,
+        "Feb": 2,
+        "Mar": 3,
+        "Apr": 4,
+        "May": 5,
+        "Jun": 6,
+        "Jul": 7,
+        "Aug": 8,
+        "Sep": 9,
+        "Oct": 10,
+        "Nov": 11,
+        "Dec": 12,
+    }
+    rename = {}
+    for col in monthday_columns(df):
+        mon = col[:3].title()
+        day = col[3:]
+        if mon in month_map:
+            iso = f"{year:04d}-{month_map[mon]:02d}-{int(day):02d}"
+            rename[col] = iso
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
+
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename = {}
+    if "ISIN" in df.columns:
+        rename["ISIN"] = "isin"
+    if "Coupon" in df.columns:
+        rename["Coupon"] = "coupon"
+    if "Coupon_Rate" in df.columns:
+        rename["Coupon_Rate"] = "coupon_rate"
+    if "Maturity_Date" in df.columns:
+        rename["Maturity_Date"] = "maturity_date"
+    if "Issue_Date" in df.columns:
+        rename["Issue_Date"] = "issue_date"
+    if "Years_to_Maturity" in df.columns:
+        rename["Years_to_Maturity"] = "years_to_maturity"
+    return df.rename(columns=rename)
+
+
+def long_to_wide(df_long: pd.DataFrame) -> pd.DataFrame:
+    df_long = df_long.copy()
+    # Normalize column names.
+    df_long = df_long.rename(
+        columns={
+            "ISIN": "isin",
+            "Coupon": "coupon",
+            "Maturity Date": "maturity_date",
+            "Issue Date": "issue_date",
+            "Close Price (% of par)": "close_price",
+        }
+    )
+    if "isin" not in df_long.columns or "date" not in df_long.columns or "close_price" not in df_long.columns:
+        raise ValueError("Long format is missing required columns.")
+
+    meta_cols = ["isin", "coupon", "maturity_date", "issue_date"]
+    meta = df_long[meta_cols].drop_duplicates(subset=["isin"]).set_index("isin")
+    prices = (
+        df_long.pivot_table(index="isin", columns="date", values="close_price", aggfunc="last")
+        .reset_index()
+        .set_index("isin")
+    )
+    wide = meta.join(prices, how="left")
+    wide.reset_index(inplace=True)
+    return wide
+
+
+def to_datetime(value: Optional[str]) -> Optional[pd.Timestamp]:
+    if not value or not isinstance(value, str):
+        return None
+    dt = pd.to_datetime(value, errors="coerce")
+    return None if pd.isna(dt) else dt
+
+
+def years_between(d1: pd.Timestamp, d2: pd.Timestamp) -> float:
+    return (d2.date() - d1.date()).days / 365.25
+
+
+def parse_coupon_rate(row: pd.Series) -> Optional[float]:
+    val = row.get("coupon_rate")
+    if pd.notna(val):
+        try:
+            return float(val)
+        except Exception:
+            pass
+    coupon = row.get("coupon")
+    if isinstance(coupon, str):
+        m = re.search(r"-?\d+(\.\d+)?", coupon.replace(",", "."))
+        if m:
+            return float(m.group(0))
+    return None
+
+
+def ytm_from_price(
+    price: float,
+    coupon_rate: float,
+    maturity: pd.Timestamp,
+    settle: pd.Timestamp,
+    *,
+    face: float = FACE_VALUE,
+    freq: int = COUPON_FREQ,
+) -> float:
+    years = years_between(settle, maturity)
+    if years <= 0 or price <= 0:
+        return float("nan")
+
+    n_periods = max(1, int(round(years * freq)))
+    coupon = face * coupon_rate / 100.0 / freq
+
+    def pv(rate: float) -> float:
+        denom = 1.0 + rate / freq
+        total = 0.0
+        for k in range(1, n_periods + 1):
+            total += coupon / (denom**k)
+        total += face / (denom**n_periods)
+        return total
+
+    # Bracket for bisection.
+    lo, hi = -0.95, 1.0
+    while pv(hi) > price and hi < 5.0:
+        hi *= 1.5
+    if pv(lo) < price:
+        return float("nan")
+
+    for _ in range(120):
+        mid = (lo + hi) / 2.0
+        val = pv(mid)
+        if abs(val - price) < 1e-8:
+            return mid
+        if val > price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def select_bonds(
+    df: pd.DataFrame,
+    date_cols: list[str],
+    *,
+    count: int,
+    max_years: float,
+) -> pd.DataFrame:
+    df = df.copy()
+    first_date = pd.to_datetime(date_cols[0])
+    df["maturity_date"] = pd.to_datetime(df["maturity_date"], errors="coerce")
+    df["years_to_maturity"] = df["maturity_date"].apply(
+        lambda d: years_between(first_date, d) if pd.notna(d) else math.nan
+    )
+    df = df[(df["years_to_maturity"] > 0) & (df["years_to_maturity"] <= max_years)]
+    df["non_missing"] = df[date_cols].notna().sum(axis=1)
+    df = df.sort_values("maturity_date")
+
+    if len(df) <= count:
+        return df
+
+    # Choose one bond per maturity bucket (quantiles), preferring completeness.
+    buckets = min(count, len(df))
+    df["bucket"] = pd.qcut(df["maturity_date"].rank(method="first"), q=buckets, duplicates="drop")
+    picked = (
+        df.sort_values(["bucket", "non_missing", "maturity_date"], ascending=[True, False, True])
+        .groupby("bucket", as_index=False, observed=True)
+        .head(1)
+    )
+    picked = picked.drop(columns=["bucket"])
+
+    # If fewer than desired due to duplicates, fill by completeness.
+    if len(picked) < count:
+        remaining = df.loc[~df.index.isin(picked.index)].sort_values(
+            ["non_missing", "maturity_date"], ascending=[False, True]
+        )
+        extra = remaining.head(count - len(picked))
+        picked = pd.concat([picked, extra], ignore_index=True)
+
+    return picked
+
+
+def compute_ytm_matrix(
+    df: pd.DataFrame,
+    date_cols: list[str],
+) -> pd.DataFrame:
+    ytm = pd.DataFrame(index=df.index, columns=date_cols, dtype="float64")
+    for idx, row in df.iterrows():
+        maturity = pd.to_datetime(row.get("maturity_date"), errors="coerce")
+        coupon_rate = parse_coupon_rate(row)
+        if pd.isna(maturity) or coupon_rate is None:
+            continue
+        for col in date_cols:
+            price = row.get(col)
+            if pd.isna(price):
+                continue
+            settle = pd.to_datetime(col)
+            ytm.loc[idx, col] = ytm_from_price(float(price), coupon_rate, maturity, settle)
+    return ytm
+
+
+def coupon_schedule(years: float, *, freq: int) -> list[float]:
+    n = max(1, int(math.ceil(years * freq)))
+    return [years - (n - k) / freq for k in range(1, n + 1)]
+
+
+def interpolate_spot(t: float, known_times: list[float], known_rates: list[float]) -> Optional[float]:
+    if not known_times:
+        return None
+    if len(known_times) == 1:
+        return known_rates[0]
+    return float(np.interp(t, known_times, known_rates))
+
+
+def bootstrap_spot_rates(
+    bonds: Iterable[dict],
+    *,
+    freq: int = COUPON_FREQ,
+) -> list[tuple[float, float]]:
+    """
+    Bootstrap spot rates using semi-annual coupon convention.
+    Returns list of (maturity_years, spot_rate) in ascending maturity order.
+    """
+    results: list[tuple[float, float]] = []
+    known_times: list[float] = []
+    known_rates: list[float] = []
+
+    for bond in sorted(bonds, key=lambda b: b["maturity_years"]):
+        years = float(bond["maturity_years"])
+        price = bond.get("price")
+        coupon_rate = bond.get("coupon_rate")
+        if price is None or coupon_rate is None or years <= 0:
+            continue
+
+        coupon = FACE_VALUE * coupon_rate / 100.0 / freq
+        times = coupon_schedule(years, freq=freq)
+
+        pv_prev = 0.0
+        for t in times[:-1]:
+            r_t = interpolate_spot(t, known_times, known_rates)
+            if r_t is None:
+                pv_prev = None
+                break
+            pv_prev += coupon / ((1.0 + r_t / freq) ** (freq * t))
+
+        if pv_prev is None:
+            continue
+
+        remaining = price - pv_prev
+        if remaining <= 0:
+            continue
+
+        t_n = times[-1]
+        denom = FACE_VALUE + coupon
+        spot = freq * ((denom / remaining) ** (1.0 / (freq * t_n)) - 1.0)
+
+        known_times.append(t_n)
+        known_rates.append(spot)
+        results.append((t_n, spot))
+
+    return results
+
+
+def interpolate_curve(
+    maturities: np.ndarray,
+    values: np.ndarray,
+    targets: np.ndarray,
+    *,
+    allow_extrap: bool = True,
+) -> np.ndarray:
+    order = np.argsort(maturities)
+    maturities = maturities[order]
+    values = values[order]
+    if len(maturities) == 0:
+        return np.full_like(targets, np.nan, dtype=float)
+    if not allow_extrap:
+        return np.interp(targets, maturities, values, left=np.nan, right=np.nan)
+    return np.interp(targets, maturities, values)
+
+
+def forward_from_spot(s1, s2, s3, s4, s5, *, freq: int = COUPON_FREQ) -> dict:
+    def fwd(s_t, s_tn, t, n):
+        if pd.isna(s_t) or pd.isna(s_tn):
+            return np.nan
+        a = (1 + s_tn / freq) ** (freq * (t + n)) / (1 + s_t / freq) ** (freq * t)
+        return freq * (a ** (1.0 / (freq * n)) - 1.0)
+
+    return {
+        "1yr_1yr": fwd(s1, s2, 1, 1),
+        "1yr_2yr": fwd(s1, s3, 1, 2),
+        "1yr_3yr": fwd(s1, s4, 1, 3),
+        "1yr_4yr": fwd(s1, s5, 1, 4),
+    }
+
+
+def log_return_cov(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    df = df.sort_index()
+    df = df.where(df > 0)
+    returns = np.log(df.shift(-1) / df)
+    returns = returns.iloc[:-1]
+    returns = returns.dropna()
+    return returns.cov()
+
+
+def pca_from_cov(cov: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
+    if cov.empty:
+        return pd.Series(dtype=float), pd.DataFrame()
+    vals, vecs = np.linalg.eigh(cov.values)
+    order = np.argsort(vals)[::-1]
+    vals = vals[order]
+    vecs = vecs[:, order]
+    eigvals = pd.Series(vals, index=[f"PC{i+1}" for i in range(len(vals))])
+    eigvecs = pd.DataFrame(vecs, index=cov.index, columns=eigvals.index)
+    return eigvals, eigvecs
+
+
+def plot_curves(
+    df: pd.DataFrame,
+    x_values: list[float],
+    columns: list[str],
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    out_path: Path,
+) -> None:
+    if df.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for idx, row in df.iterrows():
+        y_vals = row[columns].to_numpy(dtype=float)
+        if np.isnan(y_vals).all():
+            continue
+        ax.plot(x_values, y_vals, alpha=0.7, linewidth=1.0, label=str(idx))
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    if len(df) <= 12:
+        ax.legend(fontsize=7, ncols=2, frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def main() -> None:
+    args = parse_args()
+    data_path = Path(args.data)
+    if not data_path.exists():
+        raise FileNotFoundError(data_path)
+
+    df = pd.read_csv(data_path)
+    if df.empty:
+        raise ValueError("Input data is empty. Provide a non-empty dataset.")
+
+    # Handle month-day columns (bonds_clean_matrix.csv)
+    df = normalize_monthday_columns(df, args.year_hint)
+
+    date_cols = date_columns(df)
+    if not date_cols and {"date", "Close Price (% of par)", "ISIN"}.issubset(df.columns):
+        df = long_to_wide(df)
+        date_cols = date_columns(df)
+
+    df = standardize_columns(df)
+
+    if not date_cols:
+        raise ValueError("No date columns found after normalization.")
+    if "maturity_date" not in df.columns:
+        raise ValueError("Missing maturity_date column after normalization.")
+
+    # Select bonds and compute YTM.
+    selected = select_bonds(df, date_cols, count=args.select_count, max_years=args.max_years)
+    ytm_all = compute_ytm_matrix(df, date_cols)
+    ytm_selected = ytm_all.loc[selected.index]
+
+    # Output directory
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Save selected bonds list
+    selected_out = selected[
+        ["isin", "coupon", "coupon_rate", "maturity_date", "issue_date", "years_to_maturity"]
+    ].copy()
+    selected_out.to_csv(outdir / "selected_bonds.csv", index=False)
+    ytm_selected.to_csv(outdir / "selected_bonds_ytm.csv")
+
+    # Daily curves for target maturities 1-5 years.
+    target_years = np.array([1, 2, 3, 4, 5], dtype=float)
+    yield_curves = []
+    spot_curves = []
+    forward_curves = []
+
+    for col in date_cols:
+        settle = pd.to_datetime(col)
+        mats = []
+        yields = []
+        prices = []
+        coupons = []
+
+        for idx, row in selected.iterrows():
+            maturity = pd.to_datetime(row.get("maturity_date"), errors="coerce")
+            if pd.isna(maturity):
+                continue
+            years = years_between(settle, maturity)
+            if years <= 0:
+                continue
+            y = ytm_selected.loc[idx, col]
+            price = row.get(col)
+            coupon_rate = parse_coupon_rate(row)
+            if pd.isna(y) or pd.isna(price) or coupon_rate is None:
+                continue
+            mats.append(years)
+            yields.append(float(y))
+            prices.append(float(price))
+            coupons.append(float(coupon_rate))
+
+        mats_arr = np.array(mats)
+        yields_arr = np.array(yields)
+        if len(mats_arr) == 0:
+            yield_vals = np.full_like(target_years, np.nan)
+        else:
+            yield_vals = interpolate_curve(mats_arr, yields_arr, target_years, allow_extrap=not args.no_interp)
+
+        yield_curves.append({"date": col, **{f"y{int(t)}": v for t, v in zip(target_years, yield_vals)}})
+
+        # Spot curve via bootstrap
+        bond_list = []
+        for m, p, c, y in zip(mats, prices, coupons, yields):
+            bond_list.append(
+                {
+                    "maturity_years": m,
+                    "price": p,
+                    "coupon_rate": c,
+                    "ytm": y,
+                }
+            )
+
+        spot_pairs = bootstrap_spot_rates(bond_list, freq=COUPON_FREQ)
+        if spot_pairs:
+            smats = np.array([m for m, _ in spot_pairs])
+            srates = np.array([r for _, r in spot_pairs])
+            spot_vals = interpolate_curve(smats, srates, target_years, allow_extrap=not args.no_interp)
+        else:
+            spot_vals = np.full_like(target_years, np.nan)
+
+        spot_curves.append({"date": col, **{f"s{int(t)}": v for t, v in zip(target_years, spot_vals)}})
+
+        s1, s2, s3, s4, s5 = spot_vals
+        fwd = forward_from_spot(s1, s2, s3, s4, s5)
+        forward_curves.append({"date": col, **fwd})
+
+    df_yield = pd.DataFrame(yield_curves).set_index("date")
+    df_spot = pd.DataFrame(spot_curves).set_index("date")
+    df_forward = pd.DataFrame(forward_curves).set_index("date")
+
+    df_yield = df_yield[[f"y{i}" for i in range(1, 6)]]
+    df_spot = df_spot[[f"s{i}" for i in range(1, 6)]]
+    df_forward = df_forward[["1yr_1yr", "1yr_2yr", "1yr_3yr", "1yr_4yr"]]
+
+    df_yield.to_csv(outdir / "yield_curve_daily.csv")
+    df_spot.to_csv(outdir / "spot_curve_daily.csv")
+    df_forward.to_csv(outdir / "forward_curve_daily.csv")
+
+    if not args.no_plots:
+        plot_curves(
+            df_yield,
+            x_values=[1, 2, 3, 4, 5],
+            columns=[f"y{i}" for i in range(1, 6)],
+            title="Daily 1–5Y Yield Curves (YTM)",
+            xlabel="Maturity (Years)",
+            ylabel="Yield (annual, decimal)",
+            out_path=outdir / "yield_curve_daily.png",
+        )
+        plot_curves(
+            df_spot,
+            x_values=[1, 2, 3, 4, 5],
+            columns=[f"s{i}" for i in range(1, 6)],
+            title="Daily 1–5Y Spot Curves",
+            xlabel="Maturity (Years)",
+            ylabel="Spot Rate (annual, decimal)",
+            out_path=outdir / "spot_curve_daily.png",
+        )
+        plot_curves(
+            df_forward,
+            x_values=[2, 3, 4, 5],
+            columns=["1yr_1yr", "1yr_2yr", "1yr_3yr", "1yr_4yr"],
+            title="Daily 1Y Forward Curves (1Y–2Y through 1Y–5Y)",
+            xlabel="Forward End (Years)",
+            ylabel="Forward Rate (annual, decimal)",
+            out_path=outdir / "forward_curve_daily.png",
+        )
+
+    # Covariance matrices for log returns.
+    cov_yield = log_return_cov(df_yield)
+    cov_forward = log_return_cov(df_forward)
+    cov_yield.to_csv(outdir / "cov_yield.csv")
+    cov_forward.to_csv(outdir / "cov_forward.csv")
+
+    # PCA outputs
+    eigvals_y, eigvecs_y = pca_from_cov(cov_yield)
+    eigvals_f, eigvecs_f = pca_from_cov(cov_forward)
+    eigvals_y.to_csv(outdir / "pca_yield_eigenvalues.csv", header=["eigenvalue"])
+    eigvecs_y.to_csv(outdir / "pca_yield_eigenvectors.csv")
+    eigvals_f.to_csv(outdir / "pca_forward_eigenvalues.csv", header=["eigenvalue"])
+    eigvecs_f.to_csv(outdir / "pca_forward_eigenvectors.csv")
+
+    print("Wrote outputs to", outdir)
+
+
+if __name__ == "__main__":
+    main()
