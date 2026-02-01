@@ -16,10 +16,6 @@ import pandas as pd
 FACE_VALUE = 100.0
 COUPON_FREQ = 2  # semi-annual
 
-
-# Recommended 10-bond ladder for a 0–5Y curve that *includes* one bond beyond 5Y
-# to avoid extrapolation at the 5Y node.
-# (ISINs are from the provided `bonds_final_price_matrix.csv`.)
 DEFAULT_SELECTED_ISINS: list[str] = [
     "CA135087R556",  # CAN 4.0 May 26
     "CA135087R978",  # CAN 4.0 Aug 26
@@ -480,7 +476,6 @@ def main() -> None:
         missing = sorted(set(chosen_isins) - set(selected["isin"].tolist()))
         if missing:
             raise ValueError(f"These ISINs were not found in the dataset: {missing}")
-        # Preserve the user-specified order, then sort by maturity for nicer output
         selected["_order"] = selected["isin"].apply(lambda x: chosen_isins.index(x))
         selected = selected.sort_values(["_order", "maturity_date"]).drop(columns=["_order"])
     else:
