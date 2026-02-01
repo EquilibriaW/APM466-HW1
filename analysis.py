@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-APM466 Assignment Analysis
-
-Uses scraped_data/bonds_final_price_matrix.csv to:
-  - compute YTM per bond per day
-  - construct daily yield/spot/forward curves for 1-5 years
-  - compute covariance matrices of log-returns (yields, forwards)
-  - compute eigenvalues/eigenvectors (PCA)
-"""
 
 from __future__ import annotations
 
@@ -26,33 +17,85 @@ FACE_VALUE = 100.0
 COUPON_FREQ = 2  # semi-annual
 
 
+# Recommended 10-bond ladder for a 0–5Y curve that *includes* one bond beyond 5Y
+# to avoid extrapolation at the 5Y node.
+# (ISINs are from the provided `bonds_final_price_matrix.csv`.)
+DEFAULT_SELECTED_ISINS: list[str] = [
+    "CA135087R556",  # CAN 4.0 May 26
+    "CA135087R978",  # CAN 4.0 Aug 26
+    "CA135087L930",  # CAN 1.0 Sep 26
+    "CA135087M847",  # CAN 1.25 Mar 27
+    "CA135087N837",  # CAN 2.75 Sep 27
+    "CA135087T958",  # CAN 2.25 Feb 28
+    "CA135087Q491",  # CAN 3.25 Sep 28
+    "CA135087Q988",  # CAN 4.0 Mar 29
+    "CA135087S471",  # CAN 2.75 Mar 30
+    "CA135087T792",  # CAN 2.75 Mar 31
+]
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="APM466 yield/spot/forward analysis.")
-    parser.add_argument(
+    p = argparse.ArgumentParser(description="APM466 yield/spot/forward analysis (v2).")
+
+    p.add_argument(
         "--data",
-        default="scraped_data/bonds_final_price_matrix.csv",
-        help="Path to bonds_final_price_matrix.csv",
+        default="bonds_final_price_matrix.csv",
+        help="Path to bonds_final_price_matrix.csv (wide format).",
     )
-    parser.add_argument("--outdir", default="analysis_outputs", help="Output directory.")
-    parser.add_argument("--select-count", type=int, default=10, help="Number of bonds to select.")
-    parser.add_argument("--max-years", type=float, default=5.0, help="Max maturity (years) for selection.")
-    parser.add_argument(
-        "--no-interp",
+    p.add_argument("--outdir", default="analysis_outputs", help="Output directory.")
+
+    # Selection controls
+    p.add_argument(
+        "--select-count",
+        type=int,
+        default=10,
+        help="Number of bonds to auto-select (ignored if --isins/--fixed-isins is used).",
+    )
+    p.add_argument(
+        "--max-years",
+        type=float,
+        default=5.0,
+        help="Max maturity (years) for AUTO selection only.",
+    )
+    p.add_argument(
+        "--fixed-isins",
         action="store_true",
-        help="Disable interpolation of yields/spot rates to target maturities.",
+        help="Use the built-in recommended 10-bond ISIN list.",
     )
-    parser.add_argument(
+    p.add_argument(
+        "--isins",
+        default="",
+        help="Comma-separated ISIN list to use (overrides auto selection).",
+    )
+    p.add_argument(
+        "--isins-file",
+        default="",
+        help="Path to a text/CSV file containing an ISIN column or 1 ISIN per line.",
+    )
+
+    # Interp/extrap controls
+    p.add_argument(
+        "--no-extrap",
+        action="store_true",
+        help="Do not extrapolate curve nodes outside available maturities (return NaN outside range).",
+    )
+    p.add_argument(
+        "--linear-extrap",
+        action="store_true",
+        help="If extrapolation is needed, use linear extrapolation from the nearest two points \
+              (default NumPy behavior is constant endpoint).",
+    )
+
+    # Input-format helpers
+    p.add_argument(
         "--year-hint",
         type=int,
         default=2026,
         help="Year for Jan05-style columns (bonds_clean_matrix format).",
     )
-    parser.add_argument(
-        "--no-plots",
-        action="store_true",
-        help="Disable plot generation.",
-    )
-    return parser.parse_args()
+    p.add_argument("--no-plots", action="store_true", help="Disable plot generation.")
+
+    return p.parse_args()
 
 
 def date_columns(df: pd.DataFrame) -> list[str]:
@@ -85,9 +128,7 @@ def normalize_monthday_columns(df: pd.DataFrame, year: int) -> pd.DataFrame:
         if mon in month_map:
             iso = f"{year:04d}-{month_map[mon]:02d}-{int(day):02d}"
             rename[col] = iso
-    if rename:
-        df = df.rename(columns=rename)
-    return df
+    return df.rename(columns=rename) if rename else df
 
 
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,40 +146,6 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "Years_to_Maturity" in df.columns:
         rename["Years_to_Maturity"] = "years_to_maturity"
     return df.rename(columns=rename)
-
-
-def long_to_wide(df_long: pd.DataFrame) -> pd.DataFrame:
-    df_long = df_long.copy()
-    # Normalize column names.
-    df_long = df_long.rename(
-        columns={
-            "ISIN": "isin",
-            "Coupon": "coupon",
-            "Maturity Date": "maturity_date",
-            "Issue Date": "issue_date",
-            "Close Price (% of par)": "close_price",
-        }
-    )
-    if "isin" not in df_long.columns or "date" not in df_long.columns or "close_price" not in df_long.columns:
-        raise ValueError("Long format is missing required columns.")
-
-    meta_cols = ["isin", "coupon", "maturity_date", "issue_date"]
-    meta = df_long[meta_cols].drop_duplicates(subset=["isin"]).set_index("isin")
-    prices = (
-        df_long.pivot_table(index="isin", columns="date", values="close_price", aggfunc="last")
-        .reset_index()
-        .set_index("isin")
-    )
-    wide = meta.join(prices, how="left")
-    wide.reset_index(inplace=True)
-    return wide
-
-
-def to_datetime(value: Optional[str]) -> Optional[pd.Timestamp]:
-    if not value or not isinstance(value, str):
-        return None
-    dt = pd.to_datetime(value, errors="coerce")
-    return None if pd.isna(dt) else dt
 
 
 def years_between(d1: pd.Timestamp, d2: pd.Timestamp) -> float:
@@ -169,11 +176,21 @@ def ytm_from_price(
     face: float = FACE_VALUE,
     freq: int = COUPON_FREQ,
 ) -> float:
+    """Bond YTM solved by bisection.
+
+    Note: We keep the same simplifying convention as the original script:
+      - equally-spaced coupon times
+      - no accrued interest adjustment
+
+    Minor robustness change vs original: use ceil() for number of periods so the
+    period count doesn't jump due to rounding when moving settle by 1 day.
+    """
+
     years = years_between(settle, maturity)
     if years <= 0 or price <= 0:
         return float("nan")
 
-    n_periods = max(1, int(round(years * freq)))
+    n_periods = max(1, int(math.ceil(years * freq)))
     coupon = face * coupon_rate / 100.0 / freq
 
     def pv(rate: float) -> float:
@@ -184,7 +201,6 @@ def ytm_from_price(
         total += face / (denom**n_periods)
         return total
 
-    # Bracket for bisection.
     lo, hi = -0.95, 1.0
     while pv(hi) > price and hi < 5.0:
         hi *= 1.5
@@ -203,13 +219,8 @@ def ytm_from_price(
     return (lo + hi) / 2.0
 
 
-def select_bonds(
-    df: pd.DataFrame,
-    date_cols: list[str],
-    *,
-    count: int,
-    max_years: float,
-) -> pd.DataFrame:
+def select_bonds_auto(df: pd.DataFrame, date_cols: list[str], *, count: int, max_years: float) -> pd.DataFrame:
+    """Original auto-selection logic (quantile buckets by maturity, preferring completeness)."""
     df = df.copy()
     first_date = pd.to_datetime(date_cols[0])
     df["maturity_date"] = pd.to_datetime(df["maturity_date"], errors="coerce")
@@ -223,31 +234,39 @@ def select_bonds(
     if len(df) <= count:
         return df
 
-    # Choose one bond per maturity bucket (quantiles), preferring completeness.
     buckets = min(count, len(df))
     df["bucket"] = pd.qcut(df["maturity_date"].rank(method="first"), q=buckets, duplicates="drop")
     picked = (
         df.sort_values(["bucket", "non_missing", "maturity_date"], ascending=[True, False, True])
         .groupby("bucket", as_index=False, observed=True)
         .head(1)
+        .drop(columns=["bucket"])
     )
-    picked = picked.drop(columns=["bucket"])
 
-    # If fewer than desired due to duplicates, fill by completeness.
     if len(picked) < count:
         remaining = df.loc[~df.index.isin(picked.index)].sort_values(
             ["non_missing", "maturity_date"], ascending=[False, True]
         )
-        extra = remaining.head(count - len(picked))
-        picked = pd.concat([picked, extra], ignore_index=True)
+        picked = pd.concat([picked, remaining.head(count - len(picked))], ignore_index=True)
 
     return picked
 
 
-def compute_ytm_matrix(
-    df: pd.DataFrame,
-    date_cols: list[str],
-) -> pd.DataFrame:
+def load_isins_from_file(path: Path) -> list[str]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() in {".csv", ".tsv"}:
+        df = pd.read_csv(path)
+        cols = [c for c in df.columns if str(c).lower() in {"isin", "isIN".lower()}]
+        if not cols:
+            raise ValueError(f"No 'isin' column found in {path}")
+        return [str(x).strip() for x in df[cols[0]].dropna().tolist()]
+    # default: treat as text file, 1 per line
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+def compute_ytm_matrix(df: pd.DataFrame, date_cols: list[str]) -> pd.DataFrame:
     ytm = pd.DataFrame(index=df.index, columns=date_cols, dtype="float64")
     for idx, row in df.iterrows():
         maturity = pd.to_datetime(row.get("maturity_date"), errors="coerce")
@@ -276,15 +295,7 @@ def interpolate_spot(t: float, known_times: list[float], known_rates: list[float
     return float(np.interp(t, known_times, known_rates))
 
 
-def bootstrap_spot_rates(
-    bonds: Iterable[dict],
-    *,
-    freq: int = COUPON_FREQ,
-) -> list[tuple[float, float]]:
-    """
-    Bootstrap spot rates using semi-annual coupon convention.
-    Returns list of (maturity_years, spot_rate) in ascending maturity order.
-    """
+def bootstrap_spot_rates(bonds: Iterable[dict], *, freq: int = COUPON_FREQ) -> list[tuple[float, float]]:
     results: list[tuple[float, float]] = []
     known_times: list[float] = []
     known_rates: list[float] = []
@@ -325,20 +336,49 @@ def bootstrap_spot_rates(
     return results
 
 
+def _linear_extrap_1d(x: np.ndarray, xp: np.ndarray, fp: np.ndarray) -> np.ndarray:
+    """Like np.interp, but linearly extrapolates using the nearest two points."""
+    out = np.interp(x, xp, fp)  # inside range ok
+    if len(xp) < 2:
+        return out
+
+    # left side
+    left_mask = x < xp[0]
+    if np.any(left_mask):
+        slope = (fp[1] - fp[0]) / (xp[1] - xp[0])
+        out[left_mask] = fp[0] + slope * (x[left_mask] - xp[0])
+
+    # right side
+    right_mask = x > xp[-1]
+    if np.any(right_mask):
+        slope = (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+        out[right_mask] = fp[-1] + slope * (x[right_mask] - xp[-1])
+
+    return out
+
+
 def interpolate_curve(
     maturities: np.ndarray,
     values: np.ndarray,
     targets: np.ndarray,
     *,
-    allow_extrap: bool = True,
+    allow_extrap: bool,
+    linear_extrap: bool,
 ) -> np.ndarray:
     order = np.argsort(maturities)
     maturities = maturities[order]
     values = values[order]
+
     if len(maturities) == 0:
         return np.full_like(targets, np.nan, dtype=float)
+
     if not allow_extrap:
         return np.interp(targets, maturities, values, left=np.nan, right=np.nan)
+
+    if linear_extrap:
+        return _linear_extrap_1d(targets, maturities, values)
+
+    # Default NumPy behavior (constant outside range)
     return np.interp(targets, maturities, values)
 
 
@@ -362,9 +402,7 @@ def log_return_cov(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     df = df.sort_index()
     df = df.where(df > 0)
-    returns = np.log(df.shift(-1) / df)
-    returns = returns.iloc[:-1]
-    returns = returns.dropna()
+    returns = np.log(df.shift(-1) / df).iloc[:-1].dropna()
     return returns.cov()
 
 
@@ -419,49 +457,70 @@ def main() -> None:
     if df.empty:
         raise ValueError("Input data is empty. Provide a non-empty dataset.")
 
-    # Handle month-day columns (bonds_clean_matrix.csv)
     df = normalize_monthday_columns(df, args.year_hint)
-
-    date_cols = date_columns(df)
-    if not date_cols and {"date", "Close Price (% of par)", "ISIN"}.issubset(df.columns):
-        df = long_to_wide(df)
-        date_cols = date_columns(df)
-
     df = standardize_columns(df)
 
+    date_cols = date_columns(df)
     if not date_cols:
-        raise ValueError("No date columns found after normalization.")
-    if "maturity_date" not in df.columns:
-        raise ValueError("Missing maturity_date column after normalization.")
+        raise ValueError("No ISO date columns (YYYY-MM-DD) found.")
+    if "maturity_date" not in df.columns or "isin" not in df.columns:
+        raise ValueError("Missing required columns (isin, maturity_date).")
 
-    # Select bonds and compute YTM.
-    selected = select_bonds(df, date_cols, count=args.select_count, max_years=args.max_years)
+    # --- Bond selection ---
+    chosen_isins: list[str] = []
+    if args.fixed_isins:
+        chosen_isins = DEFAULT_SELECTED_ISINS.copy()
+    if args.isins.strip():
+        chosen_isins = [x.strip() for x in args.isins.split(",") if x.strip()]
+    if args.isins_file.strip():
+        chosen_isins = load_isins_from_file(Path(args.isins_file))
+
+    if chosen_isins:
+        selected = df[df["isin"].isin(chosen_isins)].copy()
+        missing = sorted(set(chosen_isins) - set(selected["isin"].tolist()))
+        if missing:
+            raise ValueError(f"These ISINs were not found in the dataset: {missing}")
+        # Preserve the user-specified order, then sort by maturity for nicer output
+        selected["_order"] = selected["isin"].apply(lambda x: chosen_isins.index(x))
+        selected = selected.sort_values(["_order", "maturity_date"]).drop(columns=["_order"])
+    else:
+        selected = select_bonds_auto(df, date_cols, count=args.select_count, max_years=args.max_years)
+
+    # Compute YTM (only once for whole df, then subselect)
     ytm_all = compute_ytm_matrix(df, date_cols)
     ytm_selected = ytm_all.loc[selected.index]
 
-    # Output directory
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Save selected bonds list
+    # Recompute years_to_maturity relative to first date for reporting
+    first_date = pd.to_datetime(date_cols[0])
+    selected = selected.copy()
+    selected["maturity_date"] = pd.to_datetime(selected["maturity_date"], errors="coerce")
+    selected["years_to_maturity"] = selected["maturity_date"].apply(
+        lambda d: years_between(first_date, d) if pd.notna(d) else math.nan
+    )
+
     selected_out = selected[
         ["isin", "coupon", "coupon_rate", "maturity_date", "issue_date", "years_to_maturity"]
     ].copy()
     selected_out.to_csv(outdir / "selected_bonds.csv", index=False)
     ytm_selected.to_csv(outdir / "selected_bonds_ytm.csv")
 
-    # Daily curves for target maturities 1-5 years.
+    # --- Build daily curves ---
     target_years = np.array([1, 2, 3, 4, 5], dtype=float)
+    allow_extrap = not args.no_extrap
+
     yield_curves = []
     spot_curves = []
     forward_curves = []
 
     for col in date_cols:
         settle = pd.to_datetime(col)
-        mats = []
-        yields = []
-        prices = []
-        coupons = []
+        mats: list[float] = []
+        yields: list[float] = []
+        prices: list[float] = []
+        coupons: list[float] = []
 
         for idx, row in selected.iterrows():
             maturity = pd.to_datetime(row.get("maturity_date"), errors="coerce")
@@ -480,48 +539,49 @@ def main() -> None:
             prices.append(float(price))
             coupons.append(float(coupon_rate))
 
-        mats_arr = np.array(mats)
-        yields_arr = np.array(yields)
+        mats_arr = np.array(mats, dtype=float)
+        yields_arr = np.array(yields, dtype=float)
+
         if len(mats_arr) == 0:
             yield_vals = np.full_like(target_years, np.nan)
         else:
-            yield_vals = interpolate_curve(mats_arr, yields_arr, target_years, allow_extrap=not args.no_interp)
+            yield_vals = interpolate_curve(
+                mats_arr,
+                yields_arr,
+                target_years,
+                allow_extrap=allow_extrap,
+                linear_extrap=args.linear_extrap,
+            )
 
         yield_curves.append({"date": col, **{f"y{int(t)}": v for t, v in zip(target_years, yield_vals)}})
 
         # Spot curve via bootstrap
-        bond_list = []
-        for m, p, c, y in zip(mats, prices, coupons, yields):
-            bond_list.append(
-                {
-                    "maturity_years": m,
-                    "price": p,
-                    "coupon_rate": c,
-                    "ytm": y,
-                }
-            )
-
+        bond_list = [
+            {"maturity_years": m, "price": p, "coupon_rate": c, "ytm": y}
+            for m, p, c, y in zip(mats, prices, coupons, yields)
+        ]
         spot_pairs = bootstrap_spot_rates(bond_list, freq=COUPON_FREQ)
         if spot_pairs:
-            smats = np.array([m for m, _ in spot_pairs])
-            srates = np.array([r for _, r in spot_pairs])
-            spot_vals = interpolate_curve(smats, srates, target_years, allow_extrap=not args.no_interp)
+            smats = np.array([m for m, _ in spot_pairs], dtype=float)
+            srates = np.array([r for _, r in spot_pairs], dtype=float)
+            spot_vals = interpolate_curve(
+                smats,
+                srates,
+                target_years,
+                allow_extrap=allow_extrap,
+                linear_extrap=args.linear_extrap,
+            )
         else:
             spot_vals = np.full_like(target_years, np.nan)
 
         spot_curves.append({"date": col, **{f"s{int(t)}": v for t, v in zip(target_years, spot_vals)}})
 
         s1, s2, s3, s4, s5 = spot_vals
-        fwd = forward_from_spot(s1, s2, s3, s4, s5)
-        forward_curves.append({"date": col, **fwd})
+        forward_curves.append({"date": col, **forward_from_spot(s1, s2, s3, s4, s5)})
 
-    df_yield = pd.DataFrame(yield_curves).set_index("date")
-    df_spot = pd.DataFrame(spot_curves).set_index("date")
-    df_forward = pd.DataFrame(forward_curves).set_index("date")
-
-    df_yield = df_yield[[f"y{i}" for i in range(1, 6)]]
-    df_spot = df_spot[[f"s{i}" for i in range(1, 6)]]
-    df_forward = df_forward[["1yr_1yr", "1yr_2yr", "1yr_3yr", "1yr_4yr"]]
+    df_yield = pd.DataFrame(yield_curves).set_index("date")[[f"y{i}" for i in range(1, 6)]]
+    df_spot = pd.DataFrame(spot_curves).set_index("date")[[f"s{i}" for i in range(1, 6)]]
+    df_forward = pd.DataFrame(forward_curves).set_index("date")[["1yr_1yr", "1yr_2yr", "1yr_3yr", "1yr_4yr"]]
 
     df_yield.to_csv(outdir / "yield_curve_daily.csv")
     df_spot.to_csv(outdir / "spot_curve_daily.csv")
@@ -556,13 +616,11 @@ def main() -> None:
             out_path=outdir / "forward_curve_daily.png",
         )
 
-    # Covariance matrices for log returns.
     cov_yield = log_return_cov(df_yield)
     cov_forward = log_return_cov(df_forward)
     cov_yield.to_csv(outdir / "cov_yield.csv")
     cov_forward.to_csv(outdir / "cov_forward.csv")
 
-    # PCA outputs
     eigvals_y, eigvecs_y = pca_from_cov(cov_yield)
     eigvals_f, eigvecs_f = pca_from_cov(cov_forward)
     eigvals_y.to_csv(outdir / "pca_yield_eigenvalues.csv", header=["eigenvalue"])
